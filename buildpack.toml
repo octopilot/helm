@@ -1,0 +1,27 @@
+api = "0.7"
+
+[buildpack]
+  description = "Package a Helm chart and produce an image containing the chart (OCI chart artifact)"
+  homepage = "https://github.com/octopilot/buildpacks"
+  id = "octopilot/helm"
+  name = "Octopilot Helm Buildpack"
+  version = "0.1.0"
+  keywords = ["helm", "chart", "oci", "kubernetes"]
+
+  [[buildpack.licenses]]
+    type = "Apache-2.0"
+    uri = "https://github.com/octopilot/buildpacks/blob/main/helm/LICENSE"
+
+[metadata]
+  include-files = ["buildpack.toml", "bin/detect", "bin/build"]
+
+[[stacks]]
+  id = "*"
+
+[[targets]]
+  os = "linux"
+  arch = "amd64"
+
+[[targets]]
+  os = "linux"
+  arch = "arm64"

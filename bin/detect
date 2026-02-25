@@ -1,0 +1,17 @@
+#!/bin/bash
+# Detect Helm chart: Chart.yaml in build dir or in chart/ subdir.
+set -e
+BUILD_DIR="${CNB_BUILD_DIR:-.}"
+CHART_DIR="${BP_HELM_CHART_DIR:-}"
+if [[ -n "${CHART_DIR}" ]]; then
+  MANIFEST="${BUILD_DIR}/${CHART_DIR}/Chart.yaml"
+else
+  MANIFEST="${BUILD_DIR}/Chart.yaml"
+  if [[ ! -f "${MANIFEST}" ]]; then
+    MANIFEST="${BUILD_DIR}/chart/Chart.yaml"
+  fi
+fi
+if [[ -f "${MANIFEST}" ]]; then
+  exit 0
+fi
+exit 100

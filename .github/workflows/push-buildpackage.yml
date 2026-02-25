@@ -1,0 +1,49 @@
+name: Push Buildpackage to GHCR
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (default: from buildpack.toml)"
+        required: false
+
+env:
+  IMAGE: ghcr.io/octopilot/helm
+
+jobs:
+  push:
+    name: Package and Push
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          elif [[ -n "${{ github.event.inputs.version }}" ]]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            V=$(awk -F'"' '/^  version = / {print $2; exit}' buildpack.toml)
+            echo "version=${V}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package buildpack
+        run: ./scripts/package.sh --version "${{ steps.version.outputs.version }}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish to GHCR
+        run: ./scripts/publish.sh --image-ref "${{ env.IMAGE }}:${{ steps.version.outputs.version }}"

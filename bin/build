@@ -1,0 +1,104 @@
+#!/bin/bash
+# Build Helm chart: install helm, run dependency build, package chart, emit launch layer + process.
+set -e
+
+BUILD_DIR="${CNB_BUILD_DIR:-/workspace}"
+LAYERS_DIR="${CNB_LAYERS_DIR:-/layers}"
+PLAN_PATH="${CNB_PLAN_PATH:-/dev/null}"
+
+if [[ ! -d "${BUILD_DIR}" ]]; then
+  echo "CNB_BUILD_DIR (${BUILD_DIR}) is not a directory" >&2
+  exit 1
+fi
+
+echo "Octopilot Helm Buildpack"
+
+# Resolve chart directory
+CHART_DIR="${BP_HELM_CHART_DIR:-}"
+if [[ -n "${CHART_DIR}" ]]; then
+  CHART_PATH="${BUILD_DIR}/${CHART_DIR}"
+else
+  if [[ -f "${BUILD_DIR}/Chart.yaml" ]]; then
+    CHART_PATH="${BUILD_DIR}"
+  elif [[ -f "${BUILD_DIR}/chart/Chart.yaml" ]]; then
+    CHART_PATH="${BUILD_DIR}/chart"
+  else
+    echo "Chart.yaml not found in ${BUILD_DIR} or ${BUILD_DIR}/chart" >&2
+    exit 1
+  fi
+fi
+
+if [[ ! -f "${CHART_PATH}/Chart.yaml" ]]; then
+  echo "Chart.yaml not found at ${CHART_PATH}" >&2
+  exit 1
+fi
+
+# Install Helm into a build+cache layer (reused)
+HELM_LAYER="${LAYERS_DIR}/helm"
+HELM_BIN="${HELM_LAYER}/bin"
+export PATH="${HELM_BIN}:${PATH}"
+
+if [[ ! -x "${HELM_BIN}/helm" ]]; then
+  echo "Installing Helm..."
+  mkdir -p "${HELM_BIN}"
+  HELM_VER="${BP_HELM_VERSION:-3.16.4}"
+  ARCH=$(uname -m)
+  case "${ARCH}" in
+    x86_64|amd64) HELM_ARCH="amd64" ;;
+    aarch64|arm64) HELM_ARCH="arm64" ;;
+    *) HELM_ARCH="amd64" ;;
+  esac
+  curl -sSL "https://get.helm.sh/helm-v${HELM_VER}-linux-${HELM_ARCH}.tar.gz" | tar -xzf - -C "${HELM_LAYER}"
+  mv "${HELM_LAYER}/linux-${HELM_ARCH}/helm" "${HELM_BIN}/helm"
+  rm -rf "${HELM_LAYER}/linux-${HELM_ARCH}"
+  chmod +x "${HELM_BIN}/helm"
+fi
+
+# Mark helm as build+cache only (not in run image)
+cat > "${LAYERS_DIR}/helm.toml" << 'TOML'
+[types]
+build = true
+cache = true
+launch = false
+TOML
+
+# Output layer: packaged chart (launch = true so it's in the run image)
+CHART_OUTPUT_LAYER="${LAYERS_DIR}/helm-chart"
+mkdir -p "${CHART_OUTPUT_LAYER}/chart"
+
+# helm dependency build (if Chart.yaml has dependencies)
+cd "${CHART_PATH}"
+if [[ -f "Chart.yaml" ]] && grep -q "dependencies:" Chart.yaml 2>/dev/null; then
+  echo "Running helm dependency build..."
+  helm dependency build . 2>/dev/null || true
+fi
+
+# Package chart to the layer
+echo "Packaging Helm chart..."
+helm package . --destination "${CHART_OUTPUT_LAYER}/chart"
+
+# Chart name is <name>-<version>.tgz from helm package
+CHART_TGZ=$(find "${CHART_OUTPUT_LAYER}/chart" -maxdepth 1 -name "*.tgz" | head -1)
+if [[ -z "${CHART_TGZ}" || ! -f "${CHART_TGZ}" ]]; then
+  echo "helm package did not produce a .tgz" >&2
+  exit 1
+fi
+
+# Canonical name for consumers (e.g. helm pull oci://... or copy from image)
+ln -sf "$(basename "${CHART_TGZ}")" "${CHART_OUTPUT_LAYER}/chart/chart.tgz" 2>/dev/null || true
+
+# This layer is included in the run image
+cat > "${LAYERS_DIR}/helm-chart.toml" << 'TOML'
+[types]
+launch = true
+TOML
+
+# Process: keep container alive so image can be pushed as OCI; chart is at /layers/octopilot_helm/helm-chart/chart/
+cat >> "${LAYERS_DIR}/launch.toml" << 'LAUNCH'
+[[processes]]
+type = "web"
+command = ["sh", "-c", "echo 'Helm chart OCI image. Chart at /layers/octopilot_helm/helm-chart/chart/*.tgz'; sleep infinity"]
+default = true
+LAUNCH
+
+echo "Helm build complete: chart packaged into launch layer"
