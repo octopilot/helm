@@ -101,4 +101,26 @@ command = ["sh", "-c", "echo 'Helm chart OCI image. Chart at /layers/octopilot_h
 default = true
 LAUNCH
 
+# When BP_HELM_OCI_REF is set, push the chart with helm push so the registry gets a proper
+# Helm OCI artifact (layer media type application/vnd.cncf.helm.chart.content.v1.tar+gzip).
+# Flux OCIRepository and "helm install oci://..." require this format; the lifecycle's
+# container image export uses generic layer types and cannot be used as a Helm chart.
+# The platform (e.g. op) should set BP_HELM_OCI_REF (e.g. ttl.sh/<uuid>-chart) and
+# run pack build with --publish false so the buildpack's helm push is the only push.
+if [[ -n "${BP_HELM_OCI_REF:-}" ]]; then
+  echo "Pushing Helm chart to OCI (BP_HELM_OCI_REF) for Flux/helm OCI format..."
+  PUSH_OUTPUT="$(helm push "${CHART_TGZ}" "oci://${BP_HELM_OCI_REF}" 2>&1)" || { echo "$PUSH_OUTPUT" >&2; exit 1; }
+  echo "$PUSH_OUTPUT"
+  DIGEST="$(echo "$PUSH_OUTPUT" | grep -oE 'sha256:[a-f0-9]+' | head -1)"
+  CHART_VERSION="$(helm show chart "$CHART_TGZ" | grep '^version:' | awk '{print $2}')"
+  # Full ref for platform to use in build_result.json (tag from chart version)
+  FULL_REF="${BP_HELM_OCI_REF}:${CHART_VERSION}@${DIGEST}"
+  echo "Pushed: ${FULL_REF}"
+  if [[ -n "${BP_HELM_OCI_OUTPUT:-}" ]] && [[ -d "${BP_HELM_OCI_OUTPUT}" ]]; then
+    echo "${DIGEST}" > "${BP_HELM_OCI_OUTPUT}/digest"
+    echo "${FULL_REF}" > "${BP_HELM_OCI_OUTPUT}/ref"
+    cp "${CHART_TGZ}" "${BP_HELM_OCI_OUTPUT}/chart.tgz" 2>/dev/null || true
+  fi
+fi
+
 echo "Helm build complete: chart packaged into launch layer"

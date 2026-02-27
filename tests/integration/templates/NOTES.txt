@@ -1,0 +1,2 @@
+Integration test chart was installed.
+Message: {{ .Values.message }}

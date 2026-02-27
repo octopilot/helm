@@ -1,0 +1,2 @@
+# Default values for integration-test-chart (used by Helm buildpack tests)
+message: "Hello from integration test"
