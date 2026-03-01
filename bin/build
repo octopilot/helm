@@ -107,11 +107,13 @@ LAUNCH
 # container image export uses generic layer types and cannot be used as a Helm chart.
 # The platform (e.g. op) should set BP_HELM_OCI_REF (e.g. ttl.sh/<uuid>-chart) and
 # run pack build with --publish false so the buildpack's helm push is the only push.
-echo "BP_HELM_OCI_REF=${BP_HELM_OCI_REF:-<unset>} BP_HELM_OCI_OUTPUT=${BP_HELM_OCI_OUTPUT:-<unset>}"
+echo "BP_HELM_OCI_REF=${BP_HELM_OCI_REF:-<unset>} BP_HELM_OCI_OUTPUT=${BP_HELM_OCI_OUTPUT:-<unset>} BP_HELM_OCI_PLAIN_HTTP=${BP_HELM_OCI_PLAIN_HTTP:-<unset>}"
 if [[ -n "${BP_HELM_OCI_REF:-}" ]]; then
   echo "Pushing Helm chart to OCI (BP_HELM_OCI_REF) for Flux/helm OCI format..."
   mkdir -p "${BP_HELM_OCI_OUTPUT:-/out}" 2>/dev/null || true
-  PUSH_OUTPUT="$(helm push "${CHART_TGZ}" "oci://${BP_HELM_OCI_REF}" 2>&1)" || { echo "$PUSH_OUTPUT" >&2; exit 1; }
+  PUSH_ARGS=("${CHART_TGZ}" "oci://${BP_HELM_OCI_REF}")
+  [[ -n "${BP_HELM_OCI_PLAIN_HTTP:-}" ]] && [[ "${BP_HELM_OCI_PLAIN_HTTP}" != "0" ]] && [[ "${BP_HELM_OCI_PLAIN_HTTP}" != "false" ]] && PUSH_ARGS+=(--plain-http)
+  PUSH_OUTPUT="$(helm push "${PUSH_ARGS[@]}" 2>&1)" || { echo "$PUSH_OUTPUT" >&2; exit 1; }
   echo "$PUSH_OUTPUT"
   DIGEST="$(echo "$PUSH_OUTPUT" | grep -oE 'sha256:[a-f0-9]+' | head -1)"
   CHART_VERSION="$(helm show chart "$CHART_TGZ" | grep '^version:' | awk '{print $2}')"
