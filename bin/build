@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build Helm chart: install helm, run dependency build, package chart, emit launch layer + process.
-set -e
+set -ex
 
 BUILD_DIR="${CNB_BUILD_DIR:-/workspace}"
 LAYERS_DIR="${CNB_LAYERS_DIR:-/layers}"
@@ -107,8 +107,10 @@ LAUNCH
 # container image export uses generic layer types and cannot be used as a Helm chart.
 # The platform (e.g. op) should set BP_HELM_OCI_REF (e.g. ttl.sh/<uuid>-chart) and
 # run pack build with --publish false so the buildpack's helm push is the only push.
+echo "BP_HELM_OCI_REF=${BP_HELM_OCI_REF:-<unset>} BP_HELM_OCI_OUTPUT=${BP_HELM_OCI_OUTPUT:-<unset>}"
 if [[ -n "${BP_HELM_OCI_REF:-}" ]]; then
   echo "Pushing Helm chart to OCI (BP_HELM_OCI_REF) for Flux/helm OCI format..."
+  mkdir -p "${BP_HELM_OCI_OUTPUT:-/out}" 2>/dev/null || true
   PUSH_OUTPUT="$(helm push "${CHART_TGZ}" "oci://${BP_HELM_OCI_REF}" 2>&1)" || { echo "$PUSH_OUTPUT" >&2; exit 1; }
   echo "$PUSH_OUTPUT"
   DIGEST="$(echo "$PUSH_OUTPUT" | grep -oE 'sha256:[a-f0-9]+' | head -1)"
@@ -116,10 +118,15 @@ if [[ -n "${BP_HELM_OCI_REF:-}" ]]; then
   # Full ref for platform to use in build_result.json (tag from chart version)
   FULL_REF="${BP_HELM_OCI_REF}:${CHART_VERSION}@${DIGEST}"
   echo "Pushed: ${FULL_REF}"
-  if [[ -n "${BP_HELM_OCI_OUTPUT:-}" ]] && [[ -d "${BP_HELM_OCI_OUTPUT}" ]]; then
-    echo "${DIGEST}" > "${BP_HELM_OCI_OUTPUT}/digest"
-    echo "${FULL_REF}" > "${BP_HELM_OCI_OUTPUT}/ref"
-    cp "${CHART_TGZ}" "${BP_HELM_OCI_OUTPUT}/chart.tgz" 2>/dev/null || true
+  if [[ -n "${BP_HELM_OCI_OUTPUT:-}" ]]; then
+    if [[ ! -d "${BP_HELM_OCI_OUTPUT}" ]]; then mkdir -p "${BP_HELM_OCI_OUTPUT}" 2>/dev/null || true; fi
+    if [[ -d "${BP_HELM_OCI_OUTPUT}" ]]; then
+      echo "${DIGEST}" > "${BP_HELM_OCI_OUTPUT}/digest"
+      echo "${FULL_REF}" > "${BP_HELM_OCI_OUTPUT}/ref"
+      cp "${CHART_TGZ}" "${BP_HELM_OCI_OUTPUT}/chart.tgz" 2>/dev/null || true
+    else
+      echo "WARNING: BP_HELM_OCI_OUTPUT ${BP_HELM_OCI_OUTPUT} is not a writable directory" >&2
+    fi
   fi
 fi
 
