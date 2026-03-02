@@ -1,0 +1,11 @@
+# Fixture for "op build" integration test (Octopilot tooling).
+# Artifact name must end with "-chart" so op uses the chart path (Publish=false,
+# BP_HELM_OCI_REF, volume /out, readChartRef). Uses ghcr.io/octopilot/builder-jammy-base.
+apiVersion: skaffold/v4beta1
+kind: Config
+build:
+  artifacts:
+    - image: helm-op-test-chart
+      context: chart
+      buildpacks:
+        builder: ghcr.io/octopilot/builder-jammy-base:latest

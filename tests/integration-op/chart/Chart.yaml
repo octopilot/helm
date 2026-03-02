@@ -1,0 +1,7 @@
+apiVersion: v2
+name: integration-op-chart
+description: Minimal chart for op (Octopilot) integration test
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+maintainers: []

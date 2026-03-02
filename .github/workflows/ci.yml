@@ -62,6 +62,7 @@ jobs:
         run: |
           BUILD_DIR="${{ steps.build-dir.outputs.dir }}"
           FIXTURE_DIR="$BUILD_DIR/tests/integration-op"
+          # Image entrypoint is "op"; pass subcommand and args only (no leading "op").
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$GITHUB_WORKSPACE:/workspace" \
@@ -69,7 +70,7 @@ jobs:
             -e GITHUB_WORKSPACE=/workspace \
             -e SKAFFOLD_DEFAULT_REPO="$SKAFFOLD_DEFAULT_REPO" \
             ghcr.io/octopilot/op:latest \
-            op build --ttl-uuid "op-helm-${{ github.run_id }}" --ttl-tag 1h --push
+            build --ttl-uuid "op-helm-${{ github.run_id }}" --ttl-tag 1h --push
 
       - name: Verify build_result.json (chart ref with digest)
         run: |
