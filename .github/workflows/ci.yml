@@ -40,43 +40,58 @@ jobs:
           tar tzf build/buildpack.tgz | head -5
 
   integration-oci-push:
-    name: Integration (OCI push)
+    name: Integration (Octopilot: op + chart path)
     runs-on: ubuntu-24.04
-    needs: [package]
     steps:
-      - name: Checkout
+      - name: Checkout buildpacks/helm
         uses: actions/checkout@v4
 
-      - name: Get version
-        id: version
-        run: |
-          V=$(awk -F'"' '/^  version = / {print $2; exit}' buildpack.toml)
-          echo "version=${V}" >> "$GITHUB_OUTPUT"
+      - name: Checkout octopilot-pipeline-tools
+        uses: actions/checkout@v4
+        with:
+          repository: octopilot/octopilot-pipeline-tools
+          path: octopilot-pipeline-tools
 
-      - name: Package buildpack
-        run: ./scripts/package.sh --version "${{ steps.version.outputs.version }}"
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: octopilot-pipeline-tools/go.mod
 
-      - name: Install Pack
+      - name: Build op
         run: |
-          PACK_VER="0.40.0"
-          curl -sSL "https://github.com/buildpacks/pack/releases/download/v${PACK_VER}/pack-v${PACK_VER}-linux.tgz" | tar -xzf - -C /tmp
-          sudo mv /tmp/pack /usr/local/bin/
-          pack version
+          cd octopilot-pipeline-tools && go build -o op ./cmd/op && mv op .. && cd ..
+          chmod +x op
+          ./op version 2>/dev/null || ./op --help 2>/dev/null || true
 
-      - name: Run OCI push integration test
+      - name: Run op build (chart path, ttl.sh)
+        env:
+          SKAFFOLD_DEFAULT_REPO: ttl.sh/op-helm-${{ github.run_id }}
         run: |
-          chmod +x tests/integration/run-oci-push.sh
-          tests/integration/run-oci-push.sh "oci-${{ github.run_id }}"
+          cd tests/integration-op
+          ../op build --push=true
+          cd ../..
 
-      - name: Run OCI push failure test
+      - name: Verify build_result.json (chart ref with digest)
         run: |
-          chmod +x tests/integration/run-oci-push-failure.sh
-          tests/integration/run-oci-push-failure.sh
+          cd tests/integration-op
+          test -f build_result.json
+          CHART_REF=$(jq -r '.builds[] | select(.imageName == "helm-op-test-chart") | .tag' build_result.json)
+          echo "Chart ref: $CHART_REF"
+          if [[ -z "$CHART_REF" ]]; then
+            echo "FAIL: no helm-op-test-chart in build_result.json" >&2
+            cat build_result.json
+            exit 1
+          fi
+          if [[ "$CHART_REF" != *"sha256:"* ]]; then
+            echo "FAIL: chart ref should contain sha256 digest: $CHART_REF" >&2
+            exit 1
+          fi
+          echo "OK: chart ref has digest"
 
   push:
     name: Push to GHCR
     runs-on: ubuntu-24.04
-    needs: [integration-oci-push]
+    needs: [package, integration-oci-push]
     if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
