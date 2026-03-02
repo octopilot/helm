@@ -39,6 +39,39 @@ jobs:
           test -f build/buildpack.tgz
           tar tzf build/buildpack.tgz | head -5
 
+  integration-oci-push:
+    name: Integration (OCI push)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          V=$(awk -F'"' '/^  version = / {print $2; exit}' buildpack.toml)
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+
+      - name: Package buildpack
+        run: ./scripts/package.sh --version "${{ steps.version.outputs.version }}"
+
+      - name: Install Pack
+        run: |
+          PACK_VER="0.40.0"
+          curl -sSL "https://github.com/buildpacks/pack/releases/download/v${PACK_VER}/pack-v${PACK_VER}-linux.tgz" | tar -xzf - -C /tmp
+          sudo mv /tmp/pack /usr/local/bin/
+          pack version
+
+      - name: Run OCI push integration test
+        run: |
+          chmod +x tests/integration/run-oci-push.sh
+          tests/integration/run-oci-push.sh "oci-${{ github.run_id }}"
+
+      - name: Run OCI push failure test
+        run: |
+          chmod +x tests/integration/run-oci-push-failure.sh
+          tests/integration/run-oci-push-failure.sh
+
   push:
     name: Push to GHCR
     runs-on: ubuntu-24.04
