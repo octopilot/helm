@@ -63,17 +63,30 @@ jobs:
           chmod +x op
           ./op version 2>/dev/null || ./op --help 2>/dev/null || true
 
+      - name: Set build dir
+        id: build-dir
+        run: |
+          if [ -d buildpacks/helm ] && [ -f buildpacks/helm/buildpack.toml ]; then
+            echo "dir=buildpacks/helm" >> "$GITHUB_OUTPUT"
+            echo "op_rel=../../op" >> "$GITHUB_OUTPUT"
+          else
+            echo "dir=." >> "$GITHUB_OUTPUT"
+            echo "op_rel=../op" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Run op build (chart path, ttl.sh)
         env:
           SKAFFOLD_DEFAULT_REPO: ttl.sh/op-helm-${{ github.run_id }}
         run: |
-          cd buildpacks/helm/tests/integration-op
-          ../../op build --push=true
-          cd ../../..
+          BUILD_DIR="${{ steps.build-dir.outputs.dir }}"
+          OP_REL="${{ steps.build-dir.outputs.op_rel }}"
+          cd "$BUILD_DIR/tests/integration-op"
+          $OP_REL build --push=true
 
       - name: Verify build_result.json (chart ref with digest)
         run: |
-          cd buildpacks/helm/tests/integration-op
+          BUILD_DIR="${{ steps.build-dir.outputs.dir }}"
+          cd "$BUILD_DIR/tests/integration-op"
           test -f build_result.json
           CHART_REF=$(jq -r '.builds[] | select(.imageName == "helm-op-test-chart") | .tag' build_result.json)
           echo "Chart ref: $CHART_REF"
