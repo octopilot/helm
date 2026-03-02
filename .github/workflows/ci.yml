@@ -40,7 +40,7 @@ jobs:
           tar tzf build/buildpack.tgz | head -5
 
   integration-oci-push:
-    name: Integration (Octopilot: op + chart path)
+    name: "Integration (Octopilot: op + chart path)"
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout buildpacks/helm
