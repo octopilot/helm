@@ -17,6 +17,7 @@ fi
 
 rm -rf "${OUT_DIR}"
 mkdir -p "${OUT_DIR}"
+chmod 764 "${OUT_DIR}"
 
 echo "Building with BP_HELM_OCI_REF=${OCI_REF} (expect push to fail)..."
 set +e
