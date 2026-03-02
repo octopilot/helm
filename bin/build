@@ -128,6 +128,10 @@ if [[ -n "${BP_HELM_OCI_REF:-}" ]]; then
   FULL_REF="${BP_HELM_OCI_REF}:${CHART_VERSION}@${DIGEST}"
   echo "Pushed: ${FULL_REF}"
   if [[ -n "${BP_HELM_OCI_OUTPUT:-}" ]]; then
+    # When build runs as root (e.g. in builder), ensure mount is writable so we can write ref/digest
+    if [[ -d "${OUT_DIR}" ]]; then
+      chmod 766 "${OUT_DIR}" 2>/dev/null || true
+    fi
     if [[ ! -d "${OUT_DIR}" ]] || [[ ! -w "${OUT_DIR}" ]]; then
       echo "ERROR: BP_HELM_OCI_OUTPUT ${BP_HELM_OCI_OUTPUT} is not a writable directory (ref/digest not written)" >&2
       exit 1

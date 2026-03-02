@@ -18,8 +18,6 @@ fi
 
 rm -rf "${OUT_DIR}"
 mkdir -p "${OUT_DIR}"
-# So the build container (often non-root) can write to the mounted volume
-chmod 764 "${OUT_DIR}"
 
 echo "Building with BP_HELM_OCI_REF=${OCI_REF} and BP_HELM_OCI_OUTPUT=/out (volume ${OUT_DIR})..."
 pack build "helm-oci-push-test:latest" \
