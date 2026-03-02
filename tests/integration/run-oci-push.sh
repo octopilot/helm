@@ -18,6 +18,9 @@ fi
 
 rm -rf "${OUT_DIR}"
 mkdir -p "${OUT_DIR}"
+# Paketo builder runs build as cnb (non-root); the buildpack cannot chmod the mount from inside.
+# Make the host dir world-writable so the container can write ref/digest.
+chmod 777 "${OUT_DIR}"
 
 echo "Building with BP_HELM_OCI_REF=${OCI_REF} and BP_HELM_OCI_OUTPUT=/out (volume ${OUT_DIR})..."
 pack build "helm-oci-push-test:latest" \
