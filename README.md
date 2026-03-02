@@ -6,8 +6,50 @@ Packages a Helm chart and produces a container image whose contents include the 
 
 ## Detection
 
-- Passes when `Chart.yaml` is present in the build context root or in a `chart/` subdirectory.
-- Optional env: `BP_HELM_CHART_DIR` — subdirectory containing `Chart.yaml` (e.g. `chart`).
+- Passes when `Chart.yaml` is present in the build context root, in a `chart/` subdirectory, or in a `chartTemplate/` subdirectory (all auto-detected).
+- Optional env: `BP_HELM_CHART_DIR` — path to the chart root. Only needed when the chart is in a subdirectory other than `chart/` or `chartTemplate/` (e.g. `BP_HELM_CHART_DIR=chart/chartTemplate` when build context is repo root).
+- Chart root must not contain a subdirectory with the same name as the chart (see [Chart layout](docs/CHART-LAYOUT.md)); otherwise Helm/Flux can report "Chart.yaml file is missing".
+
+### Supported chart layouts
+
+**Layout A — chart at build context root:** build context is the chart root (Chart.yaml at top level).
+
+```
+.                         ← build context root = chart root
+├── Chart.yaml
+├── values.yaml
+└── templates/
+    ├── NOTES.txt
+    ├── _helpers.tpl
+    └── ...
+```
+
+**Layout A — chart under `chart/`:** build context is the parent; the buildpack looks for `chart/Chart.yaml`.
+
+```
+.                         ← build context root
+└── chart/                ← chart root (auto-detected)
+    ├── Chart.yaml
+    ├── values.yaml
+    └── templates/
+        └── ...
+```
+
+**Layout B — chart in `chartTemplate/`:** build context is the directory that contains `chartTemplate` (e.g. context = `chart`). The buildpack auto-detects `chartTemplate`; no env needed. If build context is the repo root instead, set `BP_HELM_CHART_DIR=chart/chartTemplate`.
+
+```
+chart                     ← build context (e.g. context: chart)
+└── chartTemplate         ← chart root (auto-detected)
+    ├── Chart.yaml
+    ├── values.yaml
+    └── templates
+        ├── NOTES.txt
+        ├── _helpers.tpl
+        ├── deployment.yaml
+        └── ...
+```
+
+In all cases the **chart root** is the directory that directly contains `Chart.yaml`, `values.yaml`, and `templates/`. The buildpack packages that directory with `helm package .`. See [Chart layout](docs/CHART-LAYOUT.md) for rules and forbidden layouts.
 
 ## Build
 

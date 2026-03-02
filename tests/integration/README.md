@@ -1,5 +1,7 @@
 # Integration test chart
 
+Layout (chart in named subdirectory): `chartTemplate/` contains `Chart.yaml`, `values.yaml`, `templates/`. The buildpack auto-detects `chartTemplate` as the chart root.
+
 Minimal Helm chart used by the Helm buildpack CI to verify that:
 
 1. The buildpack detects `Chart.yaml` and runs.

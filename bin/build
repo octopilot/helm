@@ -24,8 +24,10 @@ else
     CHART_PATH="${BUILD_DIR}"
   elif [[ -f "${BUILD_DIR}/chart/Chart.yaml" ]]; then
     CHART_PATH="${BUILD_DIR}/chart"
+  elif [[ -f "${BUILD_DIR}/chartTemplate/Chart.yaml" ]]; then
+    CHART_PATH="${BUILD_DIR}/chartTemplate"
   else
-    echo "Chart.yaml not found in ${BUILD_DIR} or ${BUILD_DIR}/chart" >&2
+    echo "Chart.yaml not found in ${BUILD_DIR}, ${BUILD_DIR}/chart, or ${BUILD_DIR}/chartTemplate" >&2
     exit 1
   fi
 fi
@@ -34,6 +36,30 @@ if [[ ! -f "${CHART_PATH}/Chart.yaml" ]]; then
   echo "Chart.yaml not found at ${CHART_PATH}" >&2
   exit 1
 fi
+
+# ── Chart layout validation (fail during pack if layout is wrong) ─────────────────────────────
+# Ensures the packaged chart will work with Helm/Flux; see docs/CHART-LAYOUT.md.
+CHART_NAME="$(grep -E '^name:' "${CHART_PATH}/Chart.yaml" | head -1 | sed -E 's/^name:[[:space:]]*//' | tr -d '\r' | sed -E "s/^['\"]|['\"]$//g")"
+CHART_VERSION="$(grep -E '^version:' "${CHART_PATH}/Chart.yaml" | head -1 | sed -E 's/^version:[[:space:]]*//' | tr -d '\r' | sed -E "s/^['\"]|['\"]$//g")"
+
+if [[ -z "${CHART_NAME}" ]]; then
+  echo "ERROR: Chart layout invalid — Chart.yaml must contain 'name:' at chart root ${CHART_PATH}" >&2
+  echo "See buildpack docs/CHART-LAYOUT.md" >&2
+  exit 1
+fi
+if [[ -z "${CHART_VERSION}" ]]; then
+  echo "ERROR: Chart layout invalid — Chart.yaml must contain 'version:' at chart root ${CHART_PATH}" >&2
+  echo "See buildpack docs/CHART-LAYOUT.md" >&2
+  exit 1
+fi
+# Forbidden: subdirectory with same name as chart (Helm/Flux then report "Chart.yaml file is missing")
+if [[ -d "${CHART_PATH}/${CHART_NAME}" ]]; then
+  echo "ERROR: Chart layout invalid — chart root must not contain a subdirectory named '${CHART_NAME}' (same as chart name)." >&2
+  echo "Move Chart.yaml, values.yaml, templates/ to the chart root so there is no ${CHART_NAME}/${CHART_NAME}/ nesting." >&2
+  echo "See https://stackoverflow.com/questions/55605491 and buildpack docs/CHART-LAYOUT.md" >&2
+  exit 1
+fi
+echo "Chart layout OK (name=${CHART_NAME} version=${CHART_VERSION})"
 
 # Install Helm into a build+cache layer (reused)
 HELM_LAYER="${LAYERS_DIR}/helm"
@@ -76,7 +102,7 @@ if [[ -f "Chart.yaml" ]] && grep -q "dependencies:" Chart.yaml 2>/dev/null; then
 fi
 
 # Package the whole chart directory (Chart.yaml, values.yaml, templates/, etc.) — same as
-# helm package ./chartTemplate in sam; do not package only a subdirectory.
+# helm package ./chartTemplate in; do not package only a subdirectory.
 echo "Packaging Helm chart..."
 helm package . --destination "${CHART_OUTPUT_LAYER}/chart"
 

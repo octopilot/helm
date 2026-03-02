@@ -1,5 +1,7 @@
 # Integration test: op + Octopilot builder (chart path)
 
+Layout (chart in named subdirectory): `chart/chartTemplate/` contains `Chart.yaml`, `values.yaml`, `templates/`. Skaffold context is `chart`; the buildpack auto-detects `chartTemplate` as the chart root.
+
 This fixture is used by the **Integration (op + Octopilot builder)** CI job to exercise the real Octopilot pipeline:
 
 - **op** (from octopilot-pipeline-tools) runs `op build --push`
