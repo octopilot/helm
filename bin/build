@@ -13,7 +13,9 @@ fi
 
 echo "Octopilot Helm Buildpack"
 
-# Resolve chart directory
+# Resolve chart root: the directory that contains Chart.yaml (and values.yaml, templates/, etc.).
+# Same as "helm package ./chartTemplate" we must package the whole chart directory, not
+# just templates/ or a subdirectory.
 CHART_DIR="${BP_HELM_CHART_DIR:-}"
 if [[ -n "${CHART_DIR}" ]]; then
   CHART_PATH="${BUILD_DIR}/${CHART_DIR}"
@@ -73,7 +75,8 @@ if [[ -f "Chart.yaml" ]] && grep -q "dependencies:" Chart.yaml 2>/dev/null; then
   helm dependency build . 2>/dev/null || true
 fi
 
-# Package chart to the layer
+# Package the whole chart directory (Chart.yaml, values.yaml, templates/, etc.) — same as
+# helm package ./chartTemplate in sam; do not package only a subdirectory.
 echo "Packaging Helm chart..."
 helm package . --destination "${CHART_OUTPUT_LAYER}/chart"
 
@@ -123,8 +126,13 @@ if [[ -n "${BP_HELM_OCI_REF:-}" ]]; then
     exit 1
   fi
   DIGEST="$(echo "$PUSH_OUTPUT" | grep -oE 'sha256:[a-f0-9]+' | head -1)"
+  if [[ -z "${DIGEST}" ]]; then
+    echo "ERROR: could not extract digest from helm push output (platform needs ref with digest for Flux)" >&2
+    echo "$PUSH_OUTPUT" >&2
+    exit 1
+  fi
   CHART_VERSION="$(helm show chart "$CHART_TGZ" | grep '^version:' | awk '{print $2}')"
-  # Full ref for platform to use in build_result.json (tag from chart version)
+  # Full ref for platform to use in build_result.json (same as sam: repo:version@digest)
   FULL_REF="${BP_HELM_OCI_REF}:${CHART_VERSION}@${DIGEST}"
   echo "Pushed: ${FULL_REF}"
   if [[ -n "${BP_HELM_OCI_OUTPUT:-}" ]]; then
