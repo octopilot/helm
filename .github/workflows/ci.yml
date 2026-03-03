@@ -18,9 +18,28 @@ env:
   IMAGE: ghcr.io/octopilot/helm
 
 jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pytest
+        run: pip install pytest
+
+      - name: Run pytest
+        run: python -m pytest tests/unit/ -v
+
   package:
     name: Package
     runs-on: ubuntu-24.04
+    needs: [test]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,57 +58,7 @@ jobs:
           test -f build/buildpack.tgz
           tar tzf build/buildpack.tgz | head -5
 
-  # integration-oci-push:
-  #   name: "Integration (Octopilot: op + chart path)"
-  #   needs: [package]
-  #   runs-on: ubuntu-24.04
-  #   steps:
-  #     - name: Checkout buildpacks/helm
-  #       uses: actions/checkout@v4
-
-  #     - name: Set build dir
-  #       id: build-dir
-  #       run: |
-  #         if [ -d buildpacks/helm ] && [ -f buildpacks/helm/buildpack.toml ]; then
-  #           echo "dir=buildpacks/helm" >> "$GITHUB_OUTPUT"
-  #         else
-  #           echo "dir=." >> "$GITHUB_OUTPUT"
-  #         fi
-
-  #     - name: Run op build (chart path, ttl.sh)
-  #       env:
-  #         SKAFFOLD_DEFAULT_REPO: ttl.sh/op-helm-${{ github.run_id }}
-  #       run: |
-  #         BUILD_DIR="${{ steps.build-dir.outputs.dir }}"
-  #         FIXTURE_DIR="$BUILD_DIR/tests/integration-op"
-  #         # Image entrypoint is "op"; pass subcommand and args only (no leading "op").
-  #         docker run --rm \
-  #           -v /var/run/docker.sock:/var/run/docker.sock \
-  #           -v "$GITHUB_WORKSPACE:/workspace" \
-  #           -w "/workspace/$FIXTURE_DIR" \
-  #           -e GITHUB_WORKSPACE=/workspace \
-  #           -e SKAFFOLD_DEFAULT_REPO="$SKAFFOLD_DEFAULT_REPO" \
-  #           ghcr.io/octopilot/op:latest \
-  #           build --ttl-uuid "op-helm-${{ github.run_id }}" --ttl-tag 1h --push
-
-  #     - name: Verify build_result.json (chart ref with digest)
-  #       run: |
-  #         BUILD_DIR="${{ steps.build-dir.outputs.dir }}"
-  #         cd "$BUILD_DIR/tests/integration-op"
-  #         test -f build_result.json
-  #         CHART_REF=$(jq -r '.builds[] | select(.imageName == "helm-op-test-chart") | .tag' build_result.json)
-  #         echo "Chart ref: $CHART_REF"
-  #         if [[ -z "$CHART_REF" ]]; then
-  #           echo "FAIL: no helm-op-test-chart in build_result.json" >&2
-  #           cat build_result.json
-  #           exit 1
-  #         fi
-  #         if [[ "$CHART_REF" != *"sha256:"* ]]; then
-  #           echo "FAIL: chart ref should contain sha256 digest: $CHART_REF" >&2
-  #           exit 1
-  #         fi
-  #         echo "OK: chart ref has digest"
-
+  
   push:
     name: Push to GHCR
     runs-on: ubuntu-24.04

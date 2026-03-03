@@ -1,179 +1,354 @@
-#!/bin/bash
-# Build Helm chart: install helm, run dependency build, package chart, emit launch layer + process.
-set -ex
+#!/usr/bin/env python
+"""
+Build Helm chart: install helm, run dependency build, package chart, emit launch layer + process.
+Pure stdlib implementation for testability. Replaces the original shell script.
+"""
+from __future__ import annotations
 
-BUILD_DIR="${CNB_BUILD_DIR:-/workspace}"
-LAYERS_DIR="${CNB_LAYERS_DIR:-/layers}"
-PLAN_PATH="${CNB_PLAN_PATH:-/dev/null}"
+import os
+import platform
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import urllib.request
+from pathlib import Path
 
-if [[ ! -d "${BUILD_DIR}" ]]; then
-  echo "CNB_BUILD_DIR (${BUILD_DIR}) is not a directory" >&2
-  exit 1
-fi
 
-echo "Octopilot Helm Buildpack"
+def get_env(name: str, default: str = "") -> str:
+    return os.environ.get(name, default).strip()
 
-# Resolve chart root: the directory that contains Chart.yaml (and values.yaml, templates/, etc.).
-# Same as "helm package ./chartTemplate" we must package the whole chart directory, not
-# just templates/ or a subdirectory.
-CHART_DIR="${BP_HELM_CHART_DIR:-}"
-if [[ -n "${CHART_DIR}" ]]; then
-  CHART_PATH="${BUILD_DIR}/${CHART_DIR}"
-else
-  if [[ -f "${BUILD_DIR}/Chart.yaml" ]]; then
-    CHART_PATH="${BUILD_DIR}"
-  elif [[ -f "${BUILD_DIR}/chart/Chart.yaml" ]]; then
-    CHART_PATH="${BUILD_DIR}/chart"
-  elif [[ -f "${BUILD_DIR}/chartTemplate/Chart.yaml" ]]; then
-    CHART_PATH="${BUILD_DIR}/chartTemplate"
-  else
-    echo "Chart.yaml not found in ${BUILD_DIR}, ${BUILD_DIR}/chart, or ${BUILD_DIR}/chartTemplate" >&2
-    exit 1
-  fi
-fi
 
-if [[ ! -f "${CHART_PATH}/Chart.yaml" ]]; then
-  echo "Chart.yaml not found at ${CHART_PATH}" >&2
-  exit 1
-fi
+def resolve_chart_path(build_dir: Path, chart_dir_env: str) -> Path:
+    """Resolve chart root: directory that contains Chart.yaml."""
+    if chart_dir_env:
+        path = build_dir / chart_dir_env
+        if (path / "Chart.yaml").is_file():
+            return path
+        raise SystemExitWithMessage(
+            f"Chart.yaml not found at {path}",
+            "Chart.yaml not found in BP_HELM_CHART_DIR path.",
+        )
+    for candidate in ("", "chart", "chartTemplate"):
+        path = build_dir / candidate if candidate else build_dir
+        if (path / "Chart.yaml").is_file():
+            return path
+    raise SystemExitWithMessage(
+        f"Chart.yaml not found in {build_dir}, {build_dir}/chart, or {build_dir}/chartTemplate",
+        "Set BP_HELM_CHART_DIR or use a supported layout (see docs/CHART-LAYOUT.md).",
+    )
 
-# ── Chart layout validation (fail during pack if layout is wrong) ─────────────────────────────
-# Ensures the packaged chart will work with Helm/Flux; see docs/CHART-LAYOUT.md.
-CHART_NAME="$(grep -E '^name:' "${CHART_PATH}/Chart.yaml" | head -1 | sed -E 's/^name:[[:space:]]*//' | tr -d '\r' | sed -E "s/^['\"]|['\"]$//g")"
-CHART_VERSION="$(grep -E '^version:' "${CHART_PATH}/Chart.yaml" | head -1 | sed -E 's/^version:[[:space:]]*//' | tr -d '\r' | sed -E "s/^['\"]|['\"]$//g")"
 
-if [[ -z "${CHART_NAME}" ]]; then
-  echo "ERROR: Chart layout invalid — Chart.yaml must contain 'name:' at chart root ${CHART_PATH}" >&2
-  echo "See buildpack docs/CHART-LAYOUT.md" >&2
-  exit 1
-fi
-if [[ -z "${CHART_VERSION}" ]]; then
-  echo "ERROR: Chart layout invalid — Chart.yaml must contain 'version:' at chart root ${CHART_PATH}" >&2
-  echo "See buildpack docs/CHART-LAYOUT.md" >&2
-  exit 1
-fi
-# Forbidden: subdirectory with same name as chart (Helm/Flux then report "Chart.yaml file is missing")
-if [[ -d "${CHART_PATH}/${CHART_NAME}" ]]; then
-  echo "ERROR: Chart layout invalid — chart root must not contain a subdirectory named '${CHART_NAME}' (same as chart name)." >&2
-  echo "Move Chart.yaml, values.yaml, templates/ to the chart root so there is no ${CHART_NAME}/${CHART_NAME}/ nesting." >&2
-  echo "See https://stackoverflow.com/questions/55605491 and buildpack docs/CHART-LAYOUT.md" >&2
-  exit 1
-fi
-echo "Chart layout OK (name=${CHART_NAME} version=${CHART_VERSION})"
+def parse_chart_yaml_field(chart_yaml_path: Path, key: str) -> str:
+    """Parse first 'key: value' from Chart.yaml; trim quotes and whitespace."""
+    value = ""
+    prefix = key + ":"
+    with open(chart_yaml_path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.rstrip("\r\n")
+            if line.strip().startswith(prefix):
+                value = line.split(prefix, 1)[1].strip().strip("'\"").strip()
+                break
+    return value
 
-# Install Helm into a build+cache layer (reused)
-HELM_LAYER="${LAYERS_DIR}/helm"
-HELM_BIN="${HELM_LAYER}/bin"
-export PATH="${HELM_BIN}:${PATH}"
 
-if [[ ! -x "${HELM_BIN}/helm" ]]; then
-  echo "Installing Helm..."
-  mkdir -p "${HELM_BIN}"
-  HELM_VER="${BP_HELM_VERSION:-3.16.4}"
-  ARCH=$(uname -m)
-  case "${ARCH}" in
-    x86_64|amd64) HELM_ARCH="amd64" ;;
-    aarch64|arm64) HELM_ARCH="arm64" ;;
-    *) HELM_ARCH="amd64" ;;
-  esac
-  curl -sSL "https://get.helm.sh/helm-v${HELM_VER}-linux-${HELM_ARCH}.tar.gz" | tar -xzf - -C "${HELM_LAYER}"
-  mv "${HELM_LAYER}/linux-${HELM_ARCH}/helm" "${HELM_BIN}/helm"
-  rm -rf "${HELM_LAYER}/linux-${HELM_ARCH}"
-  chmod +x "${HELM_BIN}/helm"
-fi
+def chart_has_dependencies(chart_yaml_path: Path) -> bool:
+    with open(chart_yaml_path, encoding="utf-8", errors="replace") as f:
+        return "dependencies:" in f.read()
 
-# Mark helm as build+cache only (not in run image)
-cat > "${LAYERS_DIR}/helm.toml" << 'TOML'
-[types]
-build = true
-cache = true
-launch = false
-TOML
 
-# Output layer: packaged chart (launch = true so it's in the run image)
-CHART_OUTPUT_LAYER="${LAYERS_DIR}/helm-chart"
-mkdir -p "${CHART_OUTPUT_LAYER}/chart"
+def validate_chart_layout(chart_path: Path) -> tuple[str, str]:
+    """Validate layout and return (chart_name, chart_version). See docs/CHART-LAYOUT.md."""
+    chart_yaml = chart_path / "Chart.yaml"
+    if not chart_yaml.is_file():
+        raise SystemExitWithMessage(
+            f"Chart.yaml not found at {chart_path}",
+            "See buildpack docs/CHART-LAYOUT.md.",
+        )
+    name = parse_chart_yaml_field(chart_yaml, "name")
+    version = parse_chart_yaml_field(chart_yaml, "version")
+    if not name:
+        raise SystemExitWithMessage(
+            f"Chart.yaml must contain 'name:' at chart root {chart_path}",
+            "See buildpack docs/CHART-LAYOUT.md.",
+        )
+    if not version:
+        raise SystemExitWithMessage(
+            f"Chart.yaml must contain 'version:' at chart root {chart_path}",
+            "See buildpack docs/CHART-LAYOUT.md.",
+        )
+    same_name_dir = chart_path / name
+    if same_name_dir.is_dir():
+        raise SystemExitWithMessage(
+            f"Chart root must not contain a subdirectory named '{name}' (same as chart name).",
+            f"Move Chart.yaml, values.yaml, templates/ to the chart root so there is no {name}/{name}/ nesting. "
+            "See https://stackoverflow.com/questions/55605491 and buildpack docs/CHART-LAYOUT.md.",
+        )
+    return name, version
 
-# helm dependency build (if Chart.yaml has dependencies)
-cd "${CHART_PATH}"
-if [[ -f "Chart.yaml" ]] && grep -q "dependencies:" Chart.yaml 2>/dev/null; then
-  echo "Running helm dependency build..."
-  helm dependency build . 2>/dev/null || true
-fi
 
-# Package the whole chart directory (Chart.yaml, values.yaml, templates/, etc.) — same as
-# helm package ./chartTemplate in; do not package only a subdirectory.
-echo "Packaging Helm chart..."
-helm package . --destination "${CHART_OUTPUT_LAYER}/chart"
+def install_helm(helm_layer: Path, helm_version: str) -> Path:
+    """Install Helm into helm_layer/bin; return path to helm binary."""
+    helm_bin_dir = helm_layer / "bin"
+    helm_bin_dir.mkdir(parents=True, exist_ok=True)
+    helm_binary = helm_bin_dir / "helm"
+    if helm_binary.is_file() and os.access(helm_binary, os.X_OK):
+        return helm_binary
+    machine = platform.machine().lower()
+    arch_map = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
+    helm_arch = arch_map.get(machine, "amd64")
+    url = f"https://get.helm.sh/helm-v{helm_version}-linux-{helm_arch}.tar.gz"
+    print("Installing Helm...", flush=True)
+    with urllib.request.urlopen(url, timeout=60) as resp:
+        with tarfile.open(fileobj=resp, mode="r:gz") as tar:
+            tar.extractall(path=helm_layer)
+    linux_dir = helm_layer / f"linux-{helm_arch}"
+    extracted_helm = linux_dir / "helm"
+    if extracted_helm.is_file():
+        shutil.move(str(extracted_helm), str(helm_binary))
+    shutil.rmtree(linux_dir, ignore_errors=True)
+    helm_binary.chmod(helm_binary.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return helm_binary
 
-# Chart name is <name>-<version>.tgz from helm package
-CHART_TGZ=$(find "${CHART_OUTPUT_LAYER}/chart" -maxdepth 1 -name "*.tgz" | head -1)
-if [[ -z "${CHART_TGZ}" || ! -f "${CHART_TGZ}" ]]; then
-  echo "helm package did not produce a .tgz" >&2
-  exit 1
-fi
 
-# Canonical name for consumers (e.g. helm pull oci://... or copy from image)
-ln -sf "$(basename "${CHART_TGZ}")" "${CHART_OUTPUT_LAYER}/chart/chart.tgz" 2>/dev/null || true
+def run_helm(
+    helm_bin: Path,
+    args: list[str],
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    capture: bool = False,
+) -> subprocess.CompletedProcess:
+    env = env or os.environ.copy()
+    path_prepend = str(helm_bin.parent)
+    env["PATH"] = path_prepend + os.pathsep + env.get("PATH", "")
+    cmd = [str(helm_bin)] + args
+    return subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        env=env,
+        capture_output=capture,
+        text=True,
+        check=False,
+    )
 
-# This layer is included in the run image
-cat > "${LAYERS_DIR}/helm-chart.toml" << 'TOML'
-[types]
-launch = true
-TOML
 
-# Process: keep container alive so image can be pushed as OCI; chart is at /layers/octopilot_helm/helm-chart/chart/
-cat >> "${LAYERS_DIR}/launch.toml" << 'LAUNCH'
-[[processes]]
-type = "web"
-command = ["sh", "-c", "echo 'Helm chart OCI image. Chart at /layers/octopilot_helm/helm-chart/chart/*.tgz'; sleep infinity"]
-default = true
-LAUNCH
+def write_helm_toml(layers_dir: Path) -> None:
+    (layers_dir / "helm.toml").write_text(
+        "[types]\nbuild = true\ncache = true\nlaunch = false\n",
+        encoding="utf-8",
+    )
 
-# When BP_HELM_OCI_REF is set, push the chart with helm push so the registry gets a proper
-# Helm OCI artifact (layer media type application/vnd.cncf.helm.chart.content.v1.tar+gzip).
-# Flux OCIRepository and "helm install oci://..." require this format; the lifecycle's
-# container image export uses generic layer types and cannot be used as a Helm chart.
-# The platform (e.g. op) should set BP_HELM_OCI_REF (e.g. ttl.sh/<uuid>-chart) and
-# run pack build with --publish false so the buildpack's helm push is the only push.
-echo "BP_HELM_OCI_REF=${BP_HELM_OCI_REF:-<unset>} BP_HELM_OCI_OUTPUT=${BP_HELM_OCI_OUTPUT:-<unset>} BP_HELM_OCI_PLAIN_HTTP=${BP_HELM_OCI_PLAIN_HTTP:-<unset>}"
-if [[ -n "${BP_HELM_OCI_REF:-}" ]]; then
-  echo "Pushing Helm chart to OCI (BP_HELM_OCI_REF) for Flux/helm OCI format..."
-  OUT_DIR="${BP_HELM_OCI_OUTPUT:-/out}"
-  mkdir -p "${OUT_DIR}" 2>/dev/null || true
-  PUSH_ARGS=("${CHART_TGZ}" "oci://${BP_HELM_OCI_REF}")
-  [[ -n "${BP_HELM_OCI_PLAIN_HTTP:-}" ]] && [[ "${BP_HELM_OCI_PLAIN_HTTP}" != "0" ]] && [[ "${BP_HELM_OCI_PLAIN_HTTP}" != "false" ]] && PUSH_ARGS+=(--plain-http)
-  PUSH_OUTPUT="$(helm push "${PUSH_ARGS[@]}" 2>&1)" || PUSH_FAILED=1
-  echo "$PUSH_OUTPUT"
-  if [[ -n "${PUSH_FAILED:-}" ]]; then
-    if [[ -n "${BP_HELM_OCI_OUTPUT:-}" ]] && [[ -d "${OUT_DIR}" ]] && [[ -w "${OUT_DIR}" ]]; then
-      echo "helm push failed: ${PUSH_OUTPUT:-unknown}" > "${OUT_DIR}/push-failed"
-    fi
-    exit 1
-  fi
-  DIGEST="$(echo "$PUSH_OUTPUT" | grep -oE 'sha256:[a-f0-9]+' | head -1)"
-  if [[ -z "${DIGEST}" ]]; then
-    echo "ERROR: could not extract digest from helm push output (platform needs ref with digest for Flux)" >&2
-    echo "$PUSH_OUTPUT" >&2
-    exit 1
-  fi
-  CHART_VERSION="$(helm show chart "$CHART_TGZ" | grep '^version:' | awk '{print $2}')"
-  # Full ref for platform to use in build_result.json (same as sam: repo:version@digest)
-  FULL_REF="${BP_HELM_OCI_REF}:${CHART_VERSION}@${DIGEST}"
-  echo "Pushed: ${FULL_REF}"
-  if [[ -n "${BP_HELM_OCI_OUTPUT:-}" ]]; then
-    # When build runs as root (e.g. in builder), ensure mount is writable so we can write ref/digest
-    if [[ -d "${OUT_DIR}" ]]; then
-      chmod 766 "${OUT_DIR}" 2>/dev/null || true
-    fi
-    if [[ ! -d "${OUT_DIR}" ]] || [[ ! -w "${OUT_DIR}" ]]; then
-      echo "ERROR: BP_HELM_OCI_OUTPUT ${BP_HELM_OCI_OUTPUT} is not a writable directory (ref/digest not written)" >&2
-      exit 1
-    fi
-    echo "${DIGEST}" > "${OUT_DIR}/digest"
-    echo "${FULL_REF}" > "${OUT_DIR}/ref"
-    cp "${CHART_TGZ}" "${OUT_DIR}/chart.tgz" 2>/dev/null || true
-  fi
-fi
 
-echo "Helm build complete: chart packaged into launch layer"
+def write_helm_chart_toml(layers_dir: Path) -> None:
+    (layers_dir / "helm-chart.toml").write_text(
+        "[types]\nlaunch = true\n",
+        encoding="utf-8",
+    )
+
+
+def append_launch_toml(layers_dir: Path) -> None:
+    launch = layers_dir / "launch.toml"
+    content = (
+        "[[processes]]\ntype = \"web\"\n"
+        "command = [\"sh\", \"-c\", \"echo 'Helm chart OCI image. Chart at /layers/octopilot_helm/helm-chart/chart/*.tgz'; sleep infinity\"]\n"
+        "default = true\n"
+    )
+    with open(launch, "a", encoding="utf-8") as f:
+        f.write(content)
+
+
+def package_chart(
+    helm_bin: Path,
+    chart_path: Path,
+    chart_output_layer: Path,
+) -> Path:
+    """Run helm dependency build (if needed) and helm package. Return path to .tgz."""
+    chart_out = chart_output_layer / "chart"
+    chart_out.mkdir(parents=True, exist_ok=True)
+    chart_yaml = chart_path / "Chart.yaml"
+    if chart_yaml.is_file() and chart_has_dependencies(chart_yaml):
+        print("Running helm dependency build...", flush=True)
+        run_helm(helm_bin, ["dependency", "build", "."], cwd=chart_path)
+    print("Packaging Helm chart...", flush=True)
+    run_helm(
+        helm_bin,
+        ["package", ".", "--destination", str(chart_out)],
+        cwd=chart_path,
+    )
+    tgz_files = list(chart_out.glob("*.tgz"))
+    if not tgz_files:
+        raise SystemExitWithMessage(
+            "helm package did not produce a .tgz",
+            "Check chart layout and Chart.yaml.",
+        )
+    chart_tgz = tgz_files[0]
+    symlink = chart_out / "chart.tgz"
+    if symlink.exists():
+        symlink.unlink()
+    symlink.symlink_to(chart_tgz.name)
+    return chart_tgz
+
+
+def extract_digest_from_push_output(push_output: str) -> str | None:
+    match = re.search(r"sha256:[a-f0-9]+", push_output)
+    return match.group(0) if match else None
+
+
+def get_version_from_tgz(helm_bin: Path, chart_tgz: Path) -> str:
+    result = run_helm(helm_bin, ["show", "chart", str(chart_tgz)], capture=True)
+    if result.returncode != 0:
+        return ""
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("version:"):
+            return line.split(":", 1)[1].strip().strip("'\"")
+    return ""
+
+
+def oci_push(
+    helm_bin: Path,
+    chart_tgz: Path,
+    oci_ref: str,
+    out_dir: Path,
+    plain_http: bool,
+) -> None:
+    """Push chart to OCI, write ref/digest to out_dir."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    args = [str(chart_tgz), f"oci://{oci_ref}"]
+    if plain_http:
+        args.append("--plain-http")
+    result = run_helm(helm_bin, ["push"] + args, capture=True)
+    push_output = (result.stdout or "") + (result.stderr or "")
+    print(push_output, flush=True)
+    if result.returncode != 0:
+        if out_dir.is_dir():
+            try:
+                (out_dir / "push-failed").write_text(
+                    f"helm push failed: {push_output or 'unknown'}",
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+        raise SystemExitWithMessage("helm push failed", push_output or "unknown")
+    digest = extract_digest_from_push_output(push_output)
+    if not digest:
+        raise SystemExitWithMessage(
+            "Could not extract digest from helm push output (platform needs ref with digest for Flux)",
+            push_output,
+        )
+    chart_version = get_version_from_tgz(helm_bin, chart_tgz) or "0.0.0"
+    full_ref = f"{oci_ref}:{chart_version}@{digest}"
+    print(f"Pushed: {full_ref}", flush=True)
+    if not out_dir.is_dir():
+        raise SystemExitWithMessage(
+            f"BP_HELM_OCI_OUTPUT {out_dir} is not a writable directory (ref/digest not written)",
+            "Ensure the volume mount is writable.",
+        )
+    try:
+        try:
+            out_dir.chmod(stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
+        except OSError:
+            pass
+        (out_dir / "digest").write_text(digest, encoding="utf-8")
+        (out_dir / "ref").write_text(full_ref, encoding="utf-8")
+        shutil.copy2(chart_tgz, out_dir / "chart.tgz")
+    except OSError as e:
+        raise SystemExitWithMessage(
+            f"BP_HELM_OCI_OUTPUT {out_dir} is not a writable directory (ref/digest not written)",
+            str(e),
+        )
+
+
+class SystemExitWithMessage(SystemExit):
+    """Exit with code 1 and print message to stderr."""
+
+    def __init__(self, message: str, extra: str = "") -> None:
+        self.message = message
+        self.extra = extra
+        super().__init__(1)
+
+    def emit(self) -> None:
+        print(f"ERROR: {self.message}", file=sys.stderr)
+        if self.extra:
+            print(self.extra, file=sys.stderr)
+
+
+def main() -> None:
+    build_dir = Path(get_env("CNB_BUILD_DIR", "/workspace"))
+    layers_dir = Path(get_env("CNB_LAYERS_DIR", "/layers"))
+    chart_dir_env = get_env("BP_HELM_CHART_DIR")
+    helm_version = get_env("BP_HELM_VERSION", "3.16.4")
+    oci_ref = get_env("BP_HELM_OCI_REF")
+    oci_output = get_env("BP_HELM_OCI_OUTPUT", "/out")
+    plain_http_val = get_env("BP_HELM_OCI_PLAIN_HTTP").lower()
+    plain_http = plain_http_val not in ("", "0", "false")
+
+    try:
+        if not build_dir.is_dir():
+            raise SystemExitWithMessage(
+                f"CNB_BUILD_DIR ({build_dir}) is not a directory",
+                "Set CNB_BUILD_DIR to the build context path.",
+            )
+    except SystemExitWithMessage as e:
+        e.emit()
+        sys.exit(e.args[0])
+
+    print("Octopilot Helm Buildpack", flush=True)
+
+    try:
+        chart_path = resolve_chart_path(build_dir, chart_dir_env)
+    except SystemExitWithMessage as e:
+        e.emit()
+        sys.exit(1)
+
+    if not (chart_path / "Chart.yaml").is_file():
+        print(f"Chart.yaml not found at {chart_path}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        chart_name, chart_version = validate_chart_layout(chart_path)
+    except SystemExitWithMessage as e:
+        e.emit()
+        sys.exit(1)
+
+    print(f"Chart layout OK (name={chart_name} version={chart_version})", flush=True)
+
+    helm_layer = layers_dir / "helm"
+    try:
+        helm_bin = install_helm(helm_layer, helm_version)
+    except (OSError, urllib.error.URLError, KeyError) as e:
+        print(f"ERROR: Failed to install Helm: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    write_helm_toml(layers_dir)
+    chart_output_layer = layers_dir / "helm-chart"
+    try:
+        chart_tgz = package_chart(helm_bin, chart_path, chart_output_layer)
+    except SystemExitWithMessage as e:
+        e.emit()
+        sys.exit(1)
+
+    write_helm_chart_toml(layers_dir)
+    append_launch_toml(layers_dir)
+
+    print(
+        f"BP_HELM_OCI_REF={oci_ref or '<unset>'} BP_HELM_OCI_OUTPUT={oci_output or '<unset>'} "
+        f"BP_HELM_OCI_PLAIN_HTTP={get_env('BP_HELM_OCI_PLAIN_HTTP') or '<unset>'}",
+        flush=True,
+    )
+    if oci_ref:
+        print("Pushing Helm chart to OCI (BP_HELM_OCI_REF) for Flux/helm OCI format...", flush=True)
+        out_path = Path(oci_output)
+        try:
+            oci_push(helm_bin, chart_tgz, oci_ref, out_path, plain_http)
+        except SystemExitWithMessage as e:
+            e.emit()
+            sys.exit(1)
+
+    print("Helm build complete: chart packaged into launch layer", flush=True)
+
+
+if __name__ == "__main__":
+    main()

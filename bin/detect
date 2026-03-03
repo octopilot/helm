@@ -1,17 +1,41 @@
-#!/bin/bash
-# Detect Helm chart: Chart.yaml in build dir or in chart/ subdir.
-set -e
-BUILD_DIR="${CNB_BUILD_DIR:-.}"
-CHART_DIR="${BP_HELM_CHART_DIR:-}"
-if [[ -n "${CHART_DIR}" ]]; then
-  MANIFEST="${BUILD_DIR}/${CHART_DIR}/Chart.yaml"
-else
-  MANIFEST="${BUILD_DIR}/Chart.yaml"
-  if [[ ! -f "${MANIFEST}" ]]; then
-    MANIFEST="${BUILD_DIR}/chart/Chart.yaml"
-  fi
-fi
-if [[ -f "${MANIFEST}" ]]; then
-  exit 0
-fi
-exit 100
+#!/usr/bin/env python
+"""
+Detect Helm chart: Chart.yaml in build dir or in chart/ subdir (or BP_HELM_CHART_DIR).
+Pure stdlib implementation for testability. Exit 0 if chart found, 100 if not.
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+
+def get_env(name: str, default: str = "") -> str:
+    return os.environ.get(name, default).strip()
+
+
+def detect_chart(build_dir: Path, chart_dir_env: str) -> bool:
+    """
+    Return True if a Chart.yaml is found under build_dir (per detect contract).
+    Checks: BP_HELM_CHART_DIR path, then build_dir/Chart.yaml, then build_dir/chart/Chart.yaml.
+    """
+    if chart_dir_env:
+        manifest = build_dir / chart_dir_env / "Chart.yaml"
+        return manifest.is_file()
+    if (build_dir / "Chart.yaml").is_file():
+        return True
+    if (build_dir / "chart" / "Chart.yaml").is_file():
+        return True
+    return False
+
+
+def main() -> None:
+    build_dir = Path(get_env("CNB_BUILD_DIR", "."))
+    chart_dir_env = get_env("BP_HELM_CHART_DIR")
+    if detect_chart(build_dir, chart_dir_env):
+        sys.exit(0)
+    sys.exit(100)
+
+
+if __name__ == "__main__":
+    main()
