@@ -220,7 +220,7 @@ def package_chart(
 
 
 def registry_host_from_oci_ref(oci_ref: str) -> str:
-    """Return host:port from OCI ref (e.g. 'localhost:5001/org/chart' -> 'localhost:5001')."""
+    """Return host:port from OCI ref. Works for any registry (ttl.sh, ghcr.io, localhost, etc.)."""
     first = (oci_ref.split("/") or [""])[0]
     return first.strip() or "localhost:5000"
 
