@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 Detect Helm chart: Chart.yaml in build dir or in chart/ subdir (or BP_HELM_CHART_DIR).
 Pure stdlib implementation for testability. Exit 0 if chart found, 100 if not.

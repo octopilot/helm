@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 Build Helm chart: install helm, run dependency build, package chart, emit launch layer + process.
 Pure stdlib implementation for testability. Replaces the original shell script.
