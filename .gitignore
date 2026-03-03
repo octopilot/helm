@@ -1,2 +1,4 @@
 /build
 .bin/
+.helm-out/
+.helm-oci-out/

@@ -75,6 +75,7 @@ The platform (e.g. op) sets these when it wants a Helm OCI chart pushed during b
 | `BP_HELM_OCI_REF` | OCI repository reference (no tag). The buildpack runs `helm push ... oci://${BP_HELM_OCI_REF}`; Helm tags the pushed chart with the chart version (e.g. `0.1.0`). | e.g. `ttl.sh/my-uuid-chart`, `ghcr.io/org/repo-chart`, `localhost:5001/org/repo-chart` |
 | `BP_HELM_OCI_OUTPUT` | Directory where the buildpack writes `ref`, `digest`, and optionally `chart.tgz` after a successful push. Defaults to `/out` if unset. The platform typically mounts a host directory here (e.g. `--volume /host/dir:/out`). | Absolute path, e.g. `/out` |
 | `BP_HELM_OCI_PLAIN_HTTP` | When set to a non-empty value other than `0` or `false`, the buildpack passes `--plain-http` to `helm push`. **Required for HTTP/insecure registries** (e.g. local registry at `localhost:5001`). The platform should set this when the registry is in its insecure list. | e.g. `true`, `1` |
+| `BP_HELM_DOWNLOAD_INSECURE` | When set to `1`, `true`, or `yes`, the buildpack skips SSL verification when downloading Helm from get.helm.sh. Use only in environments where the download fails due to self-signed certificates or corporate proxies. | e.g. `true`, `1` |
 
 See [OCI output contract](docs/OCI-OUTPUT-CONTRACT.md) for the exact files written and behaviour on failure.
 

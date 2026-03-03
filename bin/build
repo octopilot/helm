@@ -9,10 +9,12 @@ import os
 import platform
 import re
 import shutil
+import ssl
 import stat
 import subprocess
 import sys
 import tarfile
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -89,8 +91,21 @@ def validate_chart_layout(chart_path: Path) -> tuple[str, str]:
     return name, version
 
 
+def get_system_helm() -> Path | None:
+    """Return path to helm on PATH if present and executable; else None."""
+    path = shutil.which("helm")
+    if not path:
+        return None
+    p = Path(path)
+    return p if p.is_file() and os.access(p, os.X_OK) else None
+
+
 def install_helm(helm_layer: Path, helm_version: str) -> Path:
-    """Install Helm into helm_layer/bin; return path to helm binary."""
+    """Install Helm into helm_layer/bin; return path to helm binary. Uses system helm from PATH if available."""
+    system_helm = get_system_helm()
+    if system_helm is not None:
+        print("Using Helm from PATH", flush=True)
+        return system_helm
     helm_bin_dir = helm_layer / "bin"
     helm_bin_dir.mkdir(parents=True, exist_ok=True)
     helm_binary = helm_bin_dir / "helm"
@@ -99,16 +114,29 @@ def install_helm(helm_layer: Path, helm_version: str) -> Path:
     machine = platform.machine().lower()
     arch_map = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
     helm_arch = arch_map.get(machine, "amd64")
-    url = f"https://get.helm.sh/helm-v{helm_version}-linux-{helm_arch}.tar.gz"
+    # Use current OS so direct test works on darwin; in pack build we run in Linux container.
+    uname = platform.system().lower()
+    if uname not in ("linux", "darwin"):
+        uname = "linux"
+    url = f"https://get.helm.sh/helm-v{helm_version}-{uname}-{helm_arch}.tar.gz"
     print("Installing Helm...", flush=True)
-    with urllib.request.urlopen(url, timeout=60) as resp:
-        with tarfile.open(fileobj=resp, mode="r:gz") as tar:
-            tar.extractall(path=helm_layer)
-    linux_dir = helm_layer / f"linux-{helm_arch}"
-    extracted_helm = linux_dir / "helm"
+    insecure = get_env("BP_HELM_DOWNLOAD_INSECURE").lower() in ("1", "true", "yes")
+    if insecure:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with urllib.request.urlopen(url, timeout=60, context=ctx) as resp:
+            with tarfile.open(fileobj=resp, mode="r:gz") as tar:
+                tar.extractall(path=helm_layer, filter="data")
+    else:
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            with tarfile.open(fileobj=resp, mode="r:gz") as tar:
+                tar.extractall(path=helm_layer, filter="data")
+    extracted_dir = helm_layer / f"{uname}-{helm_arch}"
+    extracted_helm = extracted_dir / "helm"
     if extracted_helm.is_file():
         shutil.move(str(extracted_helm), str(helm_binary))
-    shutil.rmtree(linux_dir, ignore_errors=True)
+    shutil.rmtree(extracted_dir, ignore_errors=True)
     helm_binary.chmod(helm_binary.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return helm_binary
 
@@ -189,6 +217,53 @@ def package_chart(
         symlink.unlink()
     symlink.symlink_to(chart_tgz.name)
     return chart_tgz
+
+
+def registry_host_from_oci_ref(oci_ref: str) -> str:
+    """Return host:port from OCI ref (e.g. 'localhost:5001/org/chart' -> 'localhost:5001')."""
+    first = (oci_ref.split("/") or [""])[0]
+    return first.strip() or "localhost:5000"
+
+
+def detect_registry_scheme(host_port: str, timeout: float = 5.0) -> bool:
+    """
+    Detect whether to use plain HTTP for the registry. Returns True for plain HTTP, False for HTTPS.
+    Order: 1) HTTPS with valid cert, 2) HTTPS with self-signed (verify disabled), 3) HTTP.
+    """
+    base = f"{host_port}/v2/"
+    # 1) HTTPS with default verification (valid cert)
+    try:
+        req = urllib.request.Request(f"https://{base}", method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status in (200, 401):
+                print("Registry scheme: HTTPS (valid cert)", flush=True)
+                return False
+    except (OSError, urllib.error.URLError, ValueError):
+        pass
+    # 2) HTTPS with self-signed / insecure
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        req = urllib.request.Request(f"https://{base}", method="GET")
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            if resp.status in (200, 401):
+                print("Registry scheme: HTTPS (self-signed/insecure)", flush=True)
+                return False
+    except (OSError, urllib.error.URLError, ValueError):
+        pass
+    # 3) Fall back to HTTP
+    try:
+        req = urllib.request.Request(f"http://{base}", method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status in (200, 401):
+                print("Registry scheme: HTTP (fallback)", flush=True)
+                return True
+    except (OSError, urllib.error.URLError, ValueError):
+        pass
+    # Default to HTTP so local/insecure registries still work
+    print("Registry scheme: HTTP (default, probe failed)", flush=True)
+    return True
 
 
 def extract_digest_from_push_output(push_output: str) -> str | None:
@@ -283,7 +358,12 @@ def main() -> None:
     oci_ref = get_env("BP_HELM_OCI_REF")
     oci_output = get_env("BP_HELM_OCI_OUTPUT", "/out")
     plain_http_val = get_env("BP_HELM_OCI_PLAIN_HTTP").lower()
-    plain_http = plain_http_val not in ("", "0", "false")
+    if plain_http_val in ("1", "true", "yes"):
+        plain_http: bool | None = True
+    elif plain_http_val in ("0", "false"):
+        plain_http = False
+    else:
+        plain_http = None  # detect when we have oci_ref
 
     try:
         if not build_dir.is_dir():
@@ -339,6 +419,9 @@ def main() -> None:
         flush=True,
     )
     if oci_ref:
+        if plain_http is None:
+            host = registry_host_from_oci_ref(oci_ref)
+            plain_http = detect_registry_scheme(host)
         print("Pushing Helm chart to OCI (BP_HELM_OCI_REF) for Flux/helm OCI format...", flush=True)
         out_path = Path(oci_output)
         try:
