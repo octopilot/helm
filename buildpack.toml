@@ -5,7 +5,7 @@ api = "0.7"
   homepage = "https://github.com/octopilot/buildpacks"
   id = "octopilot/helm"
   name = "Octopilot Helm Buildpack"
-  version = "0.1.0"
+  version = "0.1.2"
   keywords = ["helm", "chart", "oci", "kubernetes"]
 
   [[buildpack.licenses]]

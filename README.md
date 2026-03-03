@@ -2,6 +2,8 @@
 
 Packages a Helm chart and produces a container image whose contents include the packaged chart (`.tgz`).
 
+**Requirements:** `bin/detect` and `bin/build` are **pure shell scripts** (`#!/bin/sh`). The builder only needs `curl` and `tar` (for downloading Helm when not on PATH). No Python required.
+
 **Helm OCI chart for Flux / `helm install oci://`:** Pushing the **run image** (the container image from Pack) to a registry does **not** produce a Helm OCI chart. It produces a container image with generic OCI layers. Flux OCIRepository and `helm install oci://` require an artifact with layer media type `application/vnd.cncf.helm.chart.content.v1.tar+gzip`, which only **`helm push`** produces. When the platform sets `BP_HELM_OCI_REF`, this buildpack runs `helm push` during build and writes the chart ref/digest to `BP_HELM_OCI_OUTPUT`; that path is the one that produces a proper Helm OCI artifact for Flux and Helm OCI.
 
 ## Detection

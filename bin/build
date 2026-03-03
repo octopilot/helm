@@ -1,437 +1,196 @@
-#!/usr/bin/env python3
-"""
-Build Helm chart: install helm, run dependency build, package chart, emit launch layer + process.
-Pure stdlib implementation for testability. Replaces the original shell script.
-"""
-from __future__ import annotations
+#!/bin/sh
+# Build Helm chart: install helm, dependency build, package, optional OCI push.
+# Same behaviour as bin/build.python. Pure shell for builders without Python.
+set -e
 
-import os
-import platform
-import re
-import shutil
-import ssl
-import stat
-import subprocess
-import sys
-import tarfile
-import urllib.error
-import urllib.request
-from pathlib import Path
+get_env() {
+  _v=$(eval "echo \${$1:-}")
+  echo "$_v" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
 
+err_exit() {
+  echo "ERROR: $1" >&2
+  [ -n "$2" ] && echo "$2" >&2
+  exit 1
+}
 
-def get_env(name: str, default: str = "") -> str:
-    return os.environ.get(name, default).strip()
+BUILD_DIR="${CNB_BUILD_DIR:-/workspace}"
+LAYERS_DIR="${CNB_LAYERS_DIR:-/layers}"
+CHART_DIR_ENV=$(get_env BP_HELM_CHART_DIR)
+HELM_VERSION=$(get_env BP_HELM_VERSION)
+: "${HELM_VERSION:=3.16.4}"
+OCI_REF=$(get_env BP_HELM_OCI_REF)
+OCI_OUTPUT=$(get_env BP_HELM_OCI_OUTPUT)
+: "${OCI_OUTPUT:=/out}"
+PLAIN_HTTP_VAL=$(get_env BP_HELM_OCI_PLAIN_HTTP)
 
+# Resolve plain_http: 1/true/yes -> true, 0/false -> false, else unset (detect later)
+PLAIN_HTTP=""
+case "$PLAIN_HTTP_VAL" in
+  1|true|yes) PLAIN_HTTP=1 ;;
+  0|false)    PLAIN_HTTP=0 ;;
+esac
 
-def resolve_chart_path(build_dir: Path, chart_dir_env: str) -> Path:
-    """Resolve chart root: directory that contains Chart.yaml."""
-    if chart_dir_env:
-        path = build_dir / chart_dir_env
-        if (path / "Chart.yaml").is_file():
-            return path
-        raise SystemExitWithMessage(
-            f"Chart.yaml not found at {path}",
-            "Chart.yaml not found in BP_HELM_CHART_DIR path.",
-        )
-    for candidate in ("", "chart", "chartTemplate"):
-        path = build_dir / candidate if candidate else build_dir
-        if (path / "Chart.yaml").is_file():
-            return path
-    raise SystemExitWithMessage(
-        f"Chart.yaml not found in {build_dir}, {build_dir}/chart, or {build_dir}/chartTemplate",
-        "Set BP_HELM_CHART_DIR or use a supported layout (see docs/CHART-LAYOUT.md).",
-    )
+if [ ! -d "$BUILD_DIR" ]; then
+  err_exit "CNB_BUILD_DIR ($BUILD_DIR) is not a directory" "Set CNB_BUILD_DIR to the build context path."
+fi
 
+echo "Octopilot Helm Buildpack"
 
-def parse_chart_yaml_field(chart_yaml_path: Path, key: str) -> str:
-    """Parse first 'key: value' from Chart.yaml; trim quotes and whitespace."""
-    value = ""
-    prefix = key + ":"
-    with open(chart_yaml_path, encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.rstrip("\r\n")
-            if line.strip().startswith(prefix):
-                value = line.split(prefix, 1)[1].strip().strip("'\"").strip()
-                break
-    return value
+# Resolve chart path
+resolve_chart_path() {
+  if [ -n "$CHART_DIR_ENV" ]; then
+    p="$BUILD_DIR/$CHART_DIR_ENV"
+    [ -f "$p/Chart.yaml" ] || err_exit "Chart.yaml not found at $p" "Chart.yaml not found in BP_HELM_CHART_DIR path."
+    echo "$p"
+    return
+  fi
+  for c in "" "chart" "chartTemplate"; do
+    if [ -z "$c" ]; then p="$BUILD_DIR"; else p="$BUILD_DIR/$c"; fi
+    [ -f "$p/Chart.yaml" ] && echo "$p" && return
+  done
+  err_exit "Chart.yaml not found in $BUILD_DIR, $BUILD_DIR/chart, or $BUILD_DIR/chartTemplate" \
+    "Set BP_HELM_CHART_DIR or use a supported layout (see docs/CHART-LAYOUT.md)."
+}
 
+CHART_PATH=$(resolve_chart_path)
+CHART_YAML="$CHART_PATH/Chart.yaml"
+[ -f "$CHART_YAML" ] || err_exit "Chart.yaml not found at $CHART_PATH"
 
-def chart_has_dependencies(chart_yaml_path: Path) -> bool:
-    with open(chart_yaml_path, encoding="utf-8", errors="replace") as f:
-        return "dependencies:" in f.read()
+# Parse Chart.yaml field (first key: value)
+parse_field() {
+  _key="$1"
+  grep -E "^[[:space:]]*${_key}[[:space:]]*:" "$CHART_YAML" | head -1 | sed "s/.*${_key}[[:space:]]*:[[:space:]]*//;s/^[\"']//;s/[\"']$//;s/^[[:space:]]*//;s/[[:space:]]*$//"
+}
 
+CHART_NAME=$(parse_field name)
+CHART_VERSION=$(parse_field version)
+[ -n "$CHART_NAME" ] || err_exit "Chart.yaml must contain 'name:' at chart root $CHART_PATH" "See buildpack docs/CHART-LAYOUT.md."
+[ -n "$CHART_VERSION" ] || err_exit "Chart.yaml must contain 'version:' at chart root $CHART_PATH" "See buildpack docs/CHART-LAYOUT.md."
+[ ! -d "$CHART_PATH/$CHART_NAME" ] || err_exit "Chart root must not contain a subdirectory named '$CHART_NAME' (same as chart name)." \
+  "Move Chart.yaml, values.yaml, templates/ to the chart root. See buildpack docs/CHART-LAYOUT.md."
 
-def validate_chart_layout(chart_path: Path) -> tuple[str, str]:
-    """Validate layout and return (chart_name, chart_version). See docs/CHART-LAYOUT.md."""
-    chart_yaml = chart_path / "Chart.yaml"
-    if not chart_yaml.is_file():
-        raise SystemExitWithMessage(
-            f"Chart.yaml not found at {chart_path}",
-            "See buildpack docs/CHART-LAYOUT.md.",
-        )
-    name = parse_chart_yaml_field(chart_yaml, "name")
-    version = parse_chart_yaml_field(chart_yaml, "version")
-    if not name:
-        raise SystemExitWithMessage(
-            f"Chart.yaml must contain 'name:' at chart root {chart_path}",
-            "See buildpack docs/CHART-LAYOUT.md.",
-        )
-    if not version:
-        raise SystemExitWithMessage(
-            f"Chart.yaml must contain 'version:' at chart root {chart_path}",
-            "See buildpack docs/CHART-LAYOUT.md.",
-        )
-    same_name_dir = chart_path / name
-    if same_name_dir.is_dir():
-        raise SystemExitWithMessage(
-            f"Chart root must not contain a subdirectory named '{name}' (same as chart name).",
-            f"Move Chart.yaml, values.yaml, templates/ to the chart root so there is no {name}/{name}/ nesting. "
-            "See https://stackoverflow.com/questions/55605491 and buildpack docs/CHART-LAYOUT.md.",
-        )
-    return name, version
+echo "Chart layout OK (name=$CHART_NAME version=$CHART_VERSION)"
 
+# Install Helm: use system if on PATH, else download
+HELM_LAYER="$LAYERS_DIR/helm"
+HELM_BIN=""
+if command -v helm >/dev/null 2>&1; then
+  HELM_BIN=$(command -v helm)
+  echo "Using Helm from PATH"
+else
+  HELM_BIN_DIR="$HELM_LAYER/bin"
+  mkdir -p "$HELM_BIN_DIR"
+  HELM_BIN="$HELM_BIN_DIR/helm"
+  if [ -x "$HELM_BIN" ]; then
+    : # already installed
+  else
+    echo "Installing Helm..."
+    _arch=$(uname -m)
+    case "$_arch" in
+      x86_64|amd64) helm_arch=amd64 ;;
+      aarch64|arm64) helm_arch=arm64 ;;
+      *) helm_arch=amd64 ;;
+    esac
+    _os=$(uname -s | tr '[:upper:]' '[:lower:]')
+    case "$_os" in
+      linux|darwin) ;;
+      *) _os=linux ;;
+    esac
+    _url="https://get.helm.sh/helm-v${HELM_VERSION}-${_os}-${helm_arch}.tar.gz"
+    _insecure=$(get_env BP_HELM_DOWNLOAD_INSECURE)
+    _curl_extra=""
+    case "$_insecure" in
+      1|true|yes) _curl_extra="-k" ;;
+    esac
+    if ! (cd "$HELM_LAYER" && curl -sSLf $_curl_extra --connect-timeout 60 -o - "$_url" | tar -xzf -); then
+      err_exit "Failed to download or extract Helm from $_url"
+    fi
+    _extracted="$HELM_LAYER/${_os}-${helm_arch}"
+    [ -f "$_extracted/helm" ] && mv "$_extracted/helm" "$HELM_BIN"
+    rm -rf "$_extracted"
+    chmod +x "$HELM_BIN"
+  fi
+fi
 
-def get_system_helm() -> Path | None:
-    """Return path to helm on PATH if present and executable; else None."""
-    path = shutil.which("helm")
-    if not path:
-        return None
-    p = Path(path)
-    return p if p.is_file() and os.access(p, os.X_OK) else None
+# Layer tomls
+printf '%s\n' '[types]' 'build = true' 'cache = true' 'launch = false' > "$LAYERS_DIR/helm.toml"
+printf '%s\n' '[types]' 'launch = true' > "$LAYERS_DIR/helm-chart.toml"
+printf '%s\n' '[[processes]]' 'type = "web"' 'command = ["sh", "-c", "echo '\''Helm chart OCI image. Chart at /layers/octopilot_helm/helm-chart/chart/*.tgz'\''; sleep infinity"]' 'default = true' >> "$LAYERS_DIR/launch.toml"
 
+# Package chart
+CHART_OUT_LAYER="$LAYERS_DIR/helm-chart"
+CHART_OUT="$CHART_OUT_LAYER/chart"
+mkdir -p "$CHART_OUT"
 
-def install_helm(helm_layer: Path, helm_version: str) -> Path:
-    """Install Helm into helm_layer/bin; return path to helm binary. Uses system helm from PATH if available."""
-    system_helm = get_system_helm()
-    if system_helm is not None:
-        print("Using Helm from PATH", flush=True)
-        return system_helm
-    helm_bin_dir = helm_layer / "bin"
-    helm_bin_dir.mkdir(parents=True, exist_ok=True)
-    helm_binary = helm_bin_dir / "helm"
-    if helm_binary.is_file() and os.access(helm_binary, os.X_OK):
-        return helm_binary
-    machine = platform.machine().lower()
-    arch_map = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
-    helm_arch = arch_map.get(machine, "amd64")
-    # Use current OS so direct test works on darwin; in pack build we run in Linux container.
-    uname = platform.system().lower()
-    if uname not in ("linux", "darwin"):
-        uname = "linux"
-    url = f"https://get.helm.sh/helm-v{helm_version}-{uname}-{helm_arch}.tar.gz"
-    print("Installing Helm...", flush=True)
-    insecure = get_env("BP_HELM_DOWNLOAD_INSECURE").lower() in ("1", "true", "yes")
-    if insecure:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        with urllib.request.urlopen(url, timeout=60, context=ctx) as resp:
-            with tarfile.open(fileobj=resp, mode="r:gz") as tar:
-                tar.extractall(path=helm_layer, filter="data")
-    else:
-        with urllib.request.urlopen(url, timeout=60) as resp:
-            with tarfile.open(fileobj=resp, mode="r:gz") as tar:
-                tar.extractall(path=helm_layer, filter="data")
-    extracted_dir = helm_layer / f"{uname}-{helm_arch}"
-    extracted_helm = extracted_dir / "helm"
-    if extracted_helm.is_file():
-        shutil.move(str(extracted_helm), str(helm_binary))
-    shutil.rmtree(extracted_dir, ignore_errors=True)
-    helm_binary.chmod(helm_binary.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    return helm_binary
+_has_deps=0
+grep -q "dependencies:" "$CHART_YAML" 2>/dev/null && _has_deps=1
+if [ "$_has_deps" = 1 ]; then
+  echo "Running helm dependency build..."
+  (cd "$CHART_PATH" && "$HELM_BIN" dependency build .) || err_exit "helm dependency build failed"
+fi
 
+echo "Packaging Helm chart..."
+(cd "$CHART_PATH" && "$HELM_BIN" package . --destination "$CHART_OUT") || err_exit "helm package failed"
 
-def run_helm(
-    helm_bin: Path,
-    args: list[str],
-    cwd: Path | None = None,
-    env: dict[str, str] | None = None,
-    capture: bool = False,
-) -> subprocess.CompletedProcess:
-    env = env or os.environ.copy()
-    path_prepend = str(helm_bin.parent)
-    env["PATH"] = path_prepend + os.pathsep + env.get("PATH", "")
-    cmd = [str(helm_bin)] + args
-    return subprocess.run(
-        cmd,
-        cwd=str(cwd) if cwd else None,
-        env=env,
-        capture_output=capture,
-        text=True,
-        check=False,
-    )
+_tgz=$(find "$CHART_OUT" -maxdepth 1 -name '*.tgz' -print -quit)
+[ -n "$_tgz" ] && [ -f "$_tgz" ] || err_exit "helm package did not produce a .tgz" "Check chart layout and Chart.yaml."
 
+rm -f "$CHART_OUT/chart.tgz"
+ln -s "$(basename "$_tgz")" "$CHART_OUT/chart.tgz"
 
-def write_helm_toml(layers_dir: Path) -> None:
-    (layers_dir / "helm.toml").write_text(
-        "[types]\nbuild = true\ncache = true\nlaunch = false\n",
-        encoding="utf-8",
-    )
+echo "BP_HELM_OCI_REF=${OCI_REF:-<unset>} BP_HELM_OCI_OUTPUT=${OCI_OUTPUT:-<unset>} BP_HELM_OCI_PLAIN_HTTP=${PLAIN_HTTP_VAL:-<unset>}"
 
+# OCI push if BP_HELM_OCI_REF set
+if [ -n "$OCI_REF" ]; then
+  # Resolve plain_http: detect scheme if not explicitly set
+  _plain_http="$PLAIN_HTTP"
+  if [ -z "$_plain_http" ]; then
+    _host=$(echo "$OCI_REF" | cut -d/ -f1)
+    [ -z "$_host" ] && _host="localhost:5000"
+    _code=""
+    _code=$(curl -sSf -o /dev/null -w "%{http_code}" --connect-timeout 5 "https://${_host}/v2/" 2>/dev/null) || true
+    if [ "$_code" = "200" ] || [ "$_code" = "401" ]; then
+      echo "Registry scheme: HTTPS (valid cert)"
+      _plain_http=0
+    else
+      _code=$(curl -sSf -k -o /dev/null -w "%{http_code}" --connect-timeout 5 "https://${_host}/v2/" 2>/dev/null) || true
+      if [ "$_code" = "200" ] || [ "$_code" = "401" ]; then
+        echo "Registry scheme: HTTPS (self-signed/insecure)"
+        _plain_http=0
+      else
+        _code=$(curl -sSf -o /dev/null -w "%{http_code}" --connect-timeout 5 "http://${_host}/v2/" 2>/dev/null) || true
+        if [ "$_code" = "200" ] || [ "$_code" = "401" ]; then
+          echo "Registry scheme: HTTP (fallback)"
+          _plain_http=1
+        else
+          echo "Registry scheme: HTTP (default, probe failed)"
+          _plain_http=1
+        fi
+      fi
+    fi
+  fi
 
-def write_helm_chart_toml(layers_dir: Path) -> None:
-    (layers_dir / "helm-chart.toml").write_text(
-        "[types]\nlaunch = true\n",
-        encoding="utf-8",
-    )
+  echo "Pushing Helm chart to OCI (BP_HELM_OCI_REF) for Flux/helm OCI format..."
+  mkdir -p "$OCI_OUTPUT"
+  if [ "$_plain_http" = "1" ]; then
+    _push_out=$("$HELM_BIN" push "$_tgz" "oci://$OCI_REF" --plain-http 2>&1); _rc=$?
+  else
+    _push_out=$("$HELM_BIN" push "$_tgz" "oci://$OCI_REF" 2>&1); _rc=$?
+  fi
+  echo "$_push_out"
+  if [ $_rc -ne 0 ] || ! echo "$_push_out" | grep -qE 'sha256:[a-f0-9]+'; then
+    echo "helm push failed: $_push_out" > "$OCI_OUTPUT/push-failed" 2>/dev/null || true
+    err_exit "helm push failed" "$_push_out"
+  fi
+  _digest=$(echo "$_push_out" | grep -oE 'sha256:[a-f0-9]+' | head -1)
+  [ -n "$_digest" ] || err_exit "Could not extract digest from helm push output" "$_push_out"
+  _ver=$("$HELM_BIN" show chart "$_tgz" 2>/dev/null | grep -E '^version:' | sed "s/version:[[:space:]]*//;s/[\"']//g" | tr -d ' \t' || echo "0.0.0")
+  _full_ref="${OCI_REF}:${_ver}@${_digest}"
+  echo "Pushed: $_full_ref"
+  echo "$_digest" > "$OCI_OUTPUT/digest"
+  echo "$_full_ref" > "$OCI_OUTPUT/ref"
+  cp "$_tgz" "$OCI_OUTPUT/chart.tgz" 2>/dev/null || err_exit "BP_HELM_OCI_OUTPUT $OCI_OUTPUT is not a writable directory" "Ensure the volume mount is writable."
+fi
 
-
-def append_launch_toml(layers_dir: Path) -> None:
-    launch = layers_dir / "launch.toml"
-    content = (
-        "[[processes]]\ntype = \"web\"\n"
-        "command = [\"sh\", \"-c\", \"echo 'Helm chart OCI image. Chart at /layers/octopilot_helm/helm-chart/chart/*.tgz'; sleep infinity\"]\n"
-        "default = true\n"
-    )
-    with open(launch, "a", encoding="utf-8") as f:
-        f.write(content)
-
-
-def package_chart(
-    helm_bin: Path,
-    chart_path: Path,
-    chart_output_layer: Path,
-) -> Path:
-    """Run helm dependency build (if needed) and helm package. Return path to .tgz."""
-    chart_out = chart_output_layer / "chart"
-    chart_out.mkdir(parents=True, exist_ok=True)
-    chart_yaml = chart_path / "Chart.yaml"
-    if chart_yaml.is_file() and chart_has_dependencies(chart_yaml):
-        print("Running helm dependency build...", flush=True)
-        run_helm(helm_bin, ["dependency", "build", "."], cwd=chart_path)
-    print("Packaging Helm chart...", flush=True)
-    run_helm(
-        helm_bin,
-        ["package", ".", "--destination", str(chart_out)],
-        cwd=chart_path,
-    )
-    tgz_files = list(chart_out.glob("*.tgz"))
-    if not tgz_files:
-        raise SystemExitWithMessage(
-            "helm package did not produce a .tgz",
-            "Check chart layout and Chart.yaml.",
-        )
-    chart_tgz = tgz_files[0]
-    symlink = chart_out / "chart.tgz"
-    if symlink.exists():
-        symlink.unlink()
-    symlink.symlink_to(chart_tgz.name)
-    return chart_tgz
-
-
-def registry_host_from_oci_ref(oci_ref: str) -> str:
-    """Return host:port from OCI ref. Works for any registry (ttl.sh, ghcr.io, localhost, etc.)."""
-    first = (oci_ref.split("/") or [""])[0]
-    return first.strip() or "localhost:5000"
-
-
-def detect_registry_scheme(host_port: str, timeout: float = 5.0) -> bool:
-    """
-    Detect whether to use plain HTTP for the registry. Returns True for plain HTTP, False for HTTPS.
-    Order: 1) HTTPS with valid cert, 2) HTTPS with self-signed (verify disabled), 3) HTTP.
-    """
-    base = f"{host_port}/v2/"
-    # 1) HTTPS with default verification (valid cert)
-    try:
-        req = urllib.request.Request(f"https://{base}", method="GET")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if resp.status in (200, 401):
-                print("Registry scheme: HTTPS (valid cert)", flush=True)
-                return False
-    except (OSError, urllib.error.URLError, ValueError):
-        pass
-    # 2) HTTPS with self-signed / insecure
-    try:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        req = urllib.request.Request(f"https://{base}", method="GET")
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            if resp.status in (200, 401):
-                print("Registry scheme: HTTPS (self-signed/insecure)", flush=True)
-                return False
-    except (OSError, urllib.error.URLError, ValueError):
-        pass
-    # 3) Fall back to HTTP
-    try:
-        req = urllib.request.Request(f"http://{base}", method="GET")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if resp.status in (200, 401):
-                print("Registry scheme: HTTP (fallback)", flush=True)
-                return True
-    except (OSError, urllib.error.URLError, ValueError):
-        pass
-    # Default to HTTP so local/insecure registries still work
-    print("Registry scheme: HTTP (default, probe failed)", flush=True)
-    return True
-
-
-def extract_digest_from_push_output(push_output: str) -> str | None:
-    match = re.search(r"sha256:[a-f0-9]+", push_output)
-    return match.group(0) if match else None
-
-
-def get_version_from_tgz(helm_bin: Path, chart_tgz: Path) -> str:
-    result = run_helm(helm_bin, ["show", "chart", str(chart_tgz)], capture=True)
-    if result.returncode != 0:
-        return ""
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("version:"):
-            return line.split(":", 1)[1].strip().strip("'\"")
-    return ""
-
-
-def oci_push(
-    helm_bin: Path,
-    chart_tgz: Path,
-    oci_ref: str,
-    out_dir: Path,
-    plain_http: bool,
-) -> None:
-    """Push chart to OCI, write ref/digest to out_dir."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    args = [str(chart_tgz), f"oci://{oci_ref}"]
-    if plain_http:
-        args.append("--plain-http")
-    result = run_helm(helm_bin, ["push"] + args, capture=True)
-    push_output = (result.stdout or "") + (result.stderr or "")
-    print(push_output, flush=True)
-    if result.returncode != 0:
-        if out_dir.is_dir():
-            try:
-                (out_dir / "push-failed").write_text(
-                    f"helm push failed: {push_output or 'unknown'}",
-                    encoding="utf-8",
-                )
-            except OSError:
-                pass
-        raise SystemExitWithMessage("helm push failed", push_output or "unknown")
-    digest = extract_digest_from_push_output(push_output)
-    if not digest:
-        raise SystemExitWithMessage(
-            "Could not extract digest from helm push output (platform needs ref with digest for Flux)",
-            push_output,
-        )
-    chart_version = get_version_from_tgz(helm_bin, chart_tgz) or "0.0.0"
-    full_ref = f"{oci_ref}:{chart_version}@{digest}"
-    print(f"Pushed: {full_ref}", flush=True)
-    if not out_dir.is_dir():
-        raise SystemExitWithMessage(
-            f"BP_HELM_OCI_OUTPUT {out_dir} is not a writable directory (ref/digest not written)",
-            "Ensure the volume mount is writable.",
-        )
-    try:
-        try:
-            out_dir.chmod(stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
-        except OSError:
-            pass
-        (out_dir / "digest").write_text(digest, encoding="utf-8")
-        (out_dir / "ref").write_text(full_ref, encoding="utf-8")
-        shutil.copy2(chart_tgz, out_dir / "chart.tgz")
-    except OSError as e:
-        raise SystemExitWithMessage(
-            f"BP_HELM_OCI_OUTPUT {out_dir} is not a writable directory (ref/digest not written)",
-            str(e),
-        )
-
-
-class SystemExitWithMessage(SystemExit):
-    """Exit with code 1 and print message to stderr."""
-
-    def __init__(self, message: str, extra: str = "") -> None:
-        self.message = message
-        self.extra = extra
-        super().__init__(1)
-
-    def emit(self) -> None:
-        print(f"ERROR: {self.message}", file=sys.stderr)
-        if self.extra:
-            print(self.extra, file=sys.stderr)
-
-
-def main() -> None:
-    build_dir = Path(get_env("CNB_BUILD_DIR", "/workspace"))
-    layers_dir = Path(get_env("CNB_LAYERS_DIR", "/layers"))
-    chart_dir_env = get_env("BP_HELM_CHART_DIR")
-    helm_version = get_env("BP_HELM_VERSION", "3.16.4")
-    oci_ref = get_env("BP_HELM_OCI_REF")
-    oci_output = get_env("BP_HELM_OCI_OUTPUT", "/out")
-    plain_http_val = get_env("BP_HELM_OCI_PLAIN_HTTP").lower()
-    if plain_http_val in ("1", "true", "yes"):
-        plain_http: bool | None = True
-    elif plain_http_val in ("0", "false"):
-        plain_http = False
-    else:
-        plain_http = None  # detect when we have oci_ref
-
-    try:
-        if not build_dir.is_dir():
-            raise SystemExitWithMessage(
-                f"CNB_BUILD_DIR ({build_dir}) is not a directory",
-                "Set CNB_BUILD_DIR to the build context path.",
-            )
-    except SystemExitWithMessage as e:
-        e.emit()
-        sys.exit(e.args[0])
-
-    print("Octopilot Helm Buildpack", flush=True)
-
-    try:
-        chart_path = resolve_chart_path(build_dir, chart_dir_env)
-    except SystemExitWithMessage as e:
-        e.emit()
-        sys.exit(1)
-
-    if not (chart_path / "Chart.yaml").is_file():
-        print(f"Chart.yaml not found at {chart_path}", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        chart_name, chart_version = validate_chart_layout(chart_path)
-    except SystemExitWithMessage as e:
-        e.emit()
-        sys.exit(1)
-
-    print(f"Chart layout OK (name={chart_name} version={chart_version})", flush=True)
-
-    helm_layer = layers_dir / "helm"
-    try:
-        helm_bin = install_helm(helm_layer, helm_version)
-    except (OSError, urllib.error.URLError, KeyError) as e:
-        print(f"ERROR: Failed to install Helm: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    write_helm_toml(layers_dir)
-    chart_output_layer = layers_dir / "helm-chart"
-    try:
-        chart_tgz = package_chart(helm_bin, chart_path, chart_output_layer)
-    except SystemExitWithMessage as e:
-        e.emit()
-        sys.exit(1)
-
-    write_helm_chart_toml(layers_dir)
-    append_launch_toml(layers_dir)
-
-    print(
-        f"BP_HELM_OCI_REF={oci_ref or '<unset>'} BP_HELM_OCI_OUTPUT={oci_output or '<unset>'} "
-        f"BP_HELM_OCI_PLAIN_HTTP={get_env('BP_HELM_OCI_PLAIN_HTTP') or '<unset>'}",
-        flush=True,
-    )
-    if oci_ref:
-        if plain_http is None:
-            host = registry_host_from_oci_ref(oci_ref)
-            plain_http = detect_registry_scheme(host)
-        print("Pushing Helm chart to OCI (BP_HELM_OCI_REF) for Flux/helm OCI format...", flush=True)
-        out_path = Path(oci_output)
-        try:
-            oci_push(helm_bin, chart_tgz, oci_ref, out_path, plain_http)
-        except SystemExitWithMessage as e:
-            e.emit()
-            sys.exit(1)
-
-    print("Helm build complete: chart packaged into launch layer", flush=True)
-
-
-if __name__ == "__main__":
-    main()
+echo "Helm build complete: chart packaged into launch layer"
